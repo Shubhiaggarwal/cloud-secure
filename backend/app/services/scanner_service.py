@@ -64,68 +64,126 @@ def _assume_role_clients(role_arn: str, external_id: str, region: str):
     }
 
 
-def _seed_demo_account(region: str):
-    """Same seeded mock account as the original CLI tool - a realistic mix
-    of secure and insecure resources for demoing/onboarding without real
-    AWS access configured."""
+def _seed_demo_account(region: str, seed: int):
+    """
+    Builds a seeded mock AWS account with a randomized (but reproducible,
+    thanks to `seed`) mix of secure and insecure resources. Using `seed`
+    means the SAME demo account always gets the SAME findings on repeat
+    scans (so results feel stable, not random noise), while DIFFERENT
+    demo accounts get genuinely different findings from each other -
+    closer to how real, distinct AWS accounts would actually differ.
+    """
+    import random
+    rng = random.Random(seed)
+
     iam = boto3.client("iam", region_name=region)
     s3 = boto3.client("s3", region_name=region)
     ec2 = boto3.client("ec2", region_name=region)
     cloudtrail = boto3.client("cloudtrail", region_name=region)
 
-    iam.create_user(UserName="jane-doe")
-    device = iam.create_virtual_mfa_device(VirtualMFADeviceName="jane-doe-mfa")
-    serial = device["VirtualMFADevice"]["SerialNumber"]
-    iam.enable_mfa_device(
-        UserName="jane-doe", SerialNumber=serial,
-        AuthenticationCode1="123456", AuthenticationCode2="123456",
-    )
+    # --- IAM: 2-4 users, each randomly missing MFA and/or over-privileged ---
+    user_pool = ["jane-doe", "admin-user", "dev-bot", "contractor-01", "svc-deploy", "alice"]
+    rng.shuffle(user_pool)
+    users = user_pool[: rng.randint(2, 4)]
 
-    iam.create_user(UserName="admin-user")
-    iam.put_user_policy(
-        UserName="admin-user",
-        PolicyName="admin-user-full-access",
-        PolicyDocument=json.dumps({
+    for username in users:
+        iam.create_user(UserName=username)
+
+        has_mfa = rng.random() > 0.5
+        if has_mfa:
+            device = iam.create_virtual_mfa_device(VirtualMFADeviceName=f"{username}-mfa")
+            serial = device["VirtualMFADevice"]["SerialNumber"]
+            iam.enable_mfa_device(
+                UserName=username, SerialNumber=serial,
+                AuthenticationCode1="123456", AuthenticationCode2="123456",
+            )
+
+        is_overprivileged = rng.random() > 0.6
+        if is_overprivileged:
+            iam.put_user_policy(
+                UserName=username,
+                PolicyName=f"{username}-full-access",
+                PolicyDocument=json.dumps({
+                    "Version": "2012-10-17",
+                    "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}],
+                }),
+            )
+
+    # --- S3: 1-3 buckets, each randomly public/unencrypted or locked down ---
+    bucket_pool = ["company-data", "backups-prod", "user-uploads", "analytics-raw", "static-assets"]
+    rng.shuffle(bucket_pool)
+    buckets = bucket_pool[: rng.randint(1, 3)]
+
+    for bucket in buckets:
+        s3.create_bucket(Bucket=bucket)
+
+        is_public = rng.random() > 0.5
+        if is_public:
+            s3.put_bucket_policy(Bucket=bucket, Policy=json.dumps({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow", "Principal": "*",
+                    "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{bucket}/*",
+                }],
+            }))
+        else:
+            s3.put_public_access_block(
+                Bucket=bucket,
+                PublicAccessBlockConfiguration={
+                    "BlockPublicAcls": True, "IgnorePublicAcls": True,
+                    "BlockPublicPolicy": True, "RestrictPublicBuckets": True,
+                },
+            )
+
+        is_encrypted = rng.random() > 0.5
+        if is_encrypted:
+            s3.put_bucket_encryption(
+                Bucket=bucket,
+                ServerSideEncryptionConfiguration={
+                    "Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}]
+                },
+            )
+
+    # --- EC2: 1-2 security groups, each randomly with a risky open port ---
+    sg_specs = [("web-sg", 22), ("db-sg", 3389), ("app-sg", 5432)]
+    rng.shuffle(sg_specs)
+    for name, port in sg_specs[: rng.randint(1, 2)]:
+        sg = ec2.create_security_group(GroupName=name, Description=f"{name} demo group")
+        if rng.random() > 0.4:
+            ec2.authorize_security_group_ingress(
+                GroupId=sg["GroupId"],
+                IpPermissions=[{
+                    "IpProtocol": "tcp", "FromPort": port, "ToPort": port,
+                    "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+                }],
+            )
+
+    # --- CloudTrail: sometimes configured, sometimes not ---
+    if rng.random() > 0.5:
+        bucket = "cloudtrail-logs-demo"
+        s3.create_bucket(Bucket=bucket)
+        s3.put_bucket_policy(Bucket=bucket, Policy=json.dumps({
             "Version": "2012-10-17",
-            "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}],
-        }),
-    )
-
-    s3.create_bucket(Bucket="company-data")
-    s3.put_bucket_policy(Bucket="company-data", Policy=json.dumps({
-        "Version": "2012-10-17",
-        "Statement": [{
-            "Effect": "Allow", "Principal": "*",
-            "Action": "s3:GetObject", "Resource": "arn:aws:s3:::company-data/*",
-        }],
-    }))
-
-    s3.create_bucket(Bucket="secure-logs-bucket")
-    s3.put_public_access_block(
-        Bucket="secure-logs-bucket",
-        PublicAccessBlockConfiguration={
-            "BlockPublicAcls": True, "IgnorePublicAcls": True,
-            "BlockPublicPolicy": True, "RestrictPublicBuckets": True,
-        },
-    )
-    s3.put_bucket_encryption(
-        Bucket="secure-logs-bucket",
-        ServerSideEncryptionConfiguration={
-            "Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}]
-        },
-    )
-
-    sg = ec2.create_security_group(GroupName="web-sg", Description="Web server SG")
-    ec2.authorize_security_group_ingress(
-        GroupId=sg["GroupId"],
-        IpPermissions=[{
-            "IpProtocol": "tcp", "FromPort": 22, "ToPort": 22,
-            "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
-        }],
-    )
-    # CloudTrail intentionally left unconfigured -> HIGH finding
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": {"Service": "cloudtrail.amazonaws.com"},
+                "Action": "s3:PutObject", "Resource": f"arn:aws:s3:::{bucket}/*",
+            }],
+        }))
+        cloudtrail.create_trail(Name="main-trail", S3BucketName=bucket, IsMultiRegionTrail=True)
+        cloudtrail.start_logging(Name="main-trail")
+    # else: intentionally left unconfigured -> HIGH finding
 
     return {"iam": iam, "s3": s3, "ec2": ec2, "cloudtrail": cloudtrail}
+
+
+def _normalize(f: dict) -> dict:
+    """The original CLI checks return finding text under 'finding' and MITRE
+    info under 'mitre_attack'. Our API/DB schema uses 'issue' and 'mitre'.
+    Normalize here in one place rather than touching every check file."""
+    f["issue"] = f.get("issue") or f.get("finding")
+    f["mitre"] = f.get("mitre") or f.get("mitre_attack")
+    return f
 
 
 def _run_checks(clients) -> list:
@@ -159,7 +217,7 @@ def _run_checks(clients) -> list:
         f.setdefault("rule_id", f"CT-{i:03d}")
     findings += ct_findings
 
-    return findings
+    return [_normalize(f) for f in findings]
 
 
 def run_scan_for_account(aws_account) -> list:
@@ -172,7 +230,7 @@ def run_scan_for_account(aws_account) -> list:
 
     if aws_account.demo_mode == "true":
         with mock_aws():
-            clients = _seed_demo_account(region)
+            clients = _seed_demo_account(region, seed=aws_account.id)
             return _run_checks(clients)
 
     if not aws_account.role_arn:
