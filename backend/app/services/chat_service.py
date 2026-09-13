@@ -129,7 +129,7 @@ def _build_gemini_tools():
     return [types.Tool(function_declarations=declarations)]
 
 
-def get_reply(session_id: str, user_message: str, findings: list) -> str:
+def get_reply(session_id: str, user_message: str, findings: list, tool_call_log: list = None) -> str:
     """
     Sends `user_message` to Gemini with tool-calling enabled, resolving any
     tool calls against THIS scan's findings, and returns the final text
@@ -171,7 +171,8 @@ def get_reply(session_id: str, user_message: str, findings: list) -> str:
             return response.text
 
         contents.append(response.candidates[0].content)
-
+        if tool_call_log is not None:
+            tool_call_log.extend(fc.name for fc in function_calls)
         response_parts = []
         for fc in function_calls:
             func = tool_functions.get(fc.name)
